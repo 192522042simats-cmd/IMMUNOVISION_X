@@ -1,11 +1,23 @@
+"""
+IMMUNOVISION_X analysis engine.
+
+Image-based candidate detection for SRID (single radial immunodiffusion)
+and DID (double immunodiffusion / Ouchterlony) plates.
+
+All detections are *candidates*. The researcher verifies them in the app.
+Missing values are returned as NaN (never None) so tables stay numeric.
+"""
+import json
+from pathlib import Path
 
 import cv2
 import numpy as np
 import pandas as pd
-import json
-from pathlib import Path
 
 
+# ----------------------------------------------------------------------
+# Basic helpers
+# ----------------------------------------------------------------------
 def load_image(path):
     image = cv2.imread(str(path))
     if image is None:
@@ -13,442 +25,395 @@ def load_image(path):
     return image
 
 
+def downscale_if_large(image, max_side=1800):
+    """Large phone/scanner photos make Hough detection slow and noisy."""
+    h, w = image.shape[:2]
+    longest = max(h, w)
+    if longest <= max_side:
+        return image, 1.0
+    scale = max_side / longest
+    small = cv2.resize(image, (int(w * scale), int(h * scale)),
+                       interpolation=cv2.INTER_AREA)
+    return small, scale
+
+
 def prepare_image(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    gray = cv2.createCLAHE(
-        clipLimit=2.0,
-        tileGridSize=(8, 8)
-    ).apply(gray)
-    return gray
+    return cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
 
 
-def split_panels(image):
+def auto_min_radius(shape, floor=5):
+    """Scale-aware minimum well radius (about 1.2 % of the short side)."""
+    return max(floor, int(round(min(shape[:2]) * 0.012)))
+
+
+def split_panels(image, mode="single"):
     """
-    For a three-panel A/B/C figure, split into three vertical panels
-    when the image is substantially wider than it is tall.
-    Otherwise, analyse the image as one panel.
+    mode="single": analyse the whole image (default, safe for plate photos).
+    mode="three":  split a wide A/B/C figure into three vertical panels.
+    Splitting is never automatic: a landscape photo of one plate would
+    otherwise be cut through its wells.
     """
     h, w = image.shape[:2]
-
-    if w / max(h, 1) > 1.45:
+    if mode == "three":
         cuts = [0, w // 3, (2 * w) // 3, w]
         panels = []
-
         for i in range(3):
             x1, x2 = cuts[i], cuts[i + 1]
             margin = int((x2 - x1) * 0.035)
-            panels.append(
-                (image[:, x1 + margin:x2 - margin], x1 + margin, 0)
-            )
-
+            panels.append((image[:, x1 + margin:x2 - margin], x1 + margin, 0))
         return panels
-
     return [(image, 0, 0)]
 
 
-def detect_wells(panel, min_radius_px=12):
+# ----------------------------------------------------------------------
+# Well detection
+# ----------------------------------------------------------------------
+def detect_wells(panel, min_radius_px=None):
     """
-    Detect well candidates while rejecting tiny text/label artefacts.
-    The default 12-pixel threshold is targeted to the current dataset.
-    Adjust it for images with smaller genuine wells.
+    Detect circular well candidates.
+
+    min_radius_px=None -> chosen automatically from the image size, so the
+    same code works for small web figures and large scanner images.
     """
     gray = prepare_image(panel)
     h, w = gray.shape
-
     min_dim = min(h, w)
-    min_radius = max(int(min_radius_px), 5)
+
+    if min_radius_px is None:
+        min_radius_px = auto_min_radius(gray.shape)
+    min_radius = max(int(min_radius_px), 4)
     max_radius = max(min_radius + 2, int(min_dim * 0.075))
 
     blurred = cv2.GaussianBlur(gray, (7, 7), 1.5)
     candidates = []
 
     circles = cv2.HoughCircles(
-        blurred,
-        cv2.HOUGH_GRADIENT,
-        dp=1.2,
+        blurred, cv2.HOUGH_GRADIENT, dp=1.2,
         minDist=max(20, min_radius * 2),
-        param1=100,
-        param2=28,
-        minRadius=min_radius,
-        maxRadius=max_radius
+        param1=100, param2=28,
+        minRadius=min_radius, maxRadius=max_radius,
     )
-
     if circles is not None:
         for x, y, r in np.round(circles[0]).astype(int):
             if r >= min_radius:
                 candidates.append((int(x), int(y), int(r), 0.70))
 
     edges = cv2.Canny(gray, 40, 120)
-    contours, _ = cv2.findContours(
-        edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
-    )
-
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST,
+                                   cv2.CHAIN_APPROX_SIMPLE)
     for contour in contours:
         area = cv2.contourArea(contour)
         perimeter = cv2.arcLength(contour, True)
-
         if perimeter <= 0 or area <= 0:
             continue
-
         circularity = 4 * np.pi * area / (perimeter * perimeter)
-
         if circularity < 0.62:
             continue
-
         (x, y), radius = cv2.minEnclosingCircle(contour)
         radius = int(round(radius))
-
         if min_radius <= radius <= max_radius:
-            candidates.append(
-                (int(round(x)), int(round(y)), radius,
-                 float(circularity))
-            )
+            candidates.append((int(round(x)), int(round(y)), radius,
+                               float(circularity)))
 
-    # Merge duplicate Hough and contour detections.
-    candidates.sort(key=lambda item: item[3], reverse=True)
+    # Merge duplicate Hough / contour detections.
+    candidates.sort(key=lambda c: c[3], reverse=True)
     accepted = []
-
-    for candidate in candidates:
-        x, y, r, score = candidate
-
+    for x, y, r, score in candidates:
         duplicate = any(
-            np.hypot(x - ax, y - ay) <
-            max(10, min(r, ar) * 0.85)
+            np.hypot(x - ax, y - ay) < max(10, min(r, ar) * 0.85)
             for ax, ay, ar, _ in accepted
         )
-
         if not duplicate:
-            accepted.append(candidate)
+            accepted.append((x, y, r, score))
 
-    # Exclude detections close to panel borders.
-    accepted = [
-        c for c in accepted
-        if c[0] > max_radius
-        and c[1] > max_radius
-        and c[0] < w - max_radius
-        and c[1] < h - max_radius
-    ]
+    # Drop detections touching the panel border.
+    accepted = [c for c in accepted
+                if max_radius < c[0] < w - max_radius
+                and max_radius < c[1] < h - max_radius]
 
     accepted.sort(key=lambda c: (c[1], c[0]))
     return accepted
 
 
+# ----------------------------------------------------------------------
+# Ring detection (vectorised: ~50x faster than the per-pixel loops)
+# ----------------------------------------------------------------------
+_ANGLES = np.linspace(0, 2 * np.pi, 96, endpoint=False)
+_COS, _SIN = np.cos(_ANGLES), np.sin(_ANGLES)
+
 
 def ring_support(edges, x, y, radius):
-    """
-    Calculate circular edge support from a precomputed Canny edge map.
-    This produces a candidate score, not biological confirmation.
-    """
+    """Fraction of the circle (+/-2 px) that lies on a Canny edge."""
     h, w = edges.shape
-    angles = np.linspace(0, 2 * np.pi, 96, endpoint=False)
-    supported = 0
-
-    for angle in angles:
-        found = False
-
-        for delta in (-2, -1, 0, 1, 2):
-            r = radius + delta
-            px = int(round(x + r * np.cos(angle)))
-            py = int(round(y + r * np.sin(angle)))
-
-            if 0 <= px < w and 0 <= py < h:
-                if edges[py, px] > 0:
-                    found = True
-                    break
-
-        if found:
-            supported += 1
-
-    return supported / len(angles)
+    found = np.zeros(len(_ANGLES), dtype=bool)
+    for delta in (-2, -1, 0, 1, 2):
+        r = radius + delta
+        px = np.rint(x + r * _COS).astype(int)
+        py = np.rint(y + r * _SIN).astype(int)
+        ok = (px >= 0) & (px < w) & (py >= 0) & (py < h)
+        hit = np.zeros(len(_ANGLES), dtype=bool)
+        hit[ok] = edges[py[ok], px[ok]] > 0
+        found |= hit
+    return float(found.mean())
 
 
-
-def analyse_srid(image_path, output_dir):
+def radial_profile_ring(gray, x, y, well_radius, max_radius):
     """
-    SRID image analysis.
-    Outputs candidate well and ring measurements in pixels.
-    Candidate measurements require manual verification.
+    Second opinion on the ring radius from the mean radial intensity
+    profile: precipitin rings show up as a sharp change in brightness.
+    Returns (radius, strength) or (nan, 0).
     """
-    image = load_image(image_path)
+    h, w = gray.shape
+    radii = np.arange(int(well_radius * 1.3), int(max_radius) + 1)
+    if len(radii) < 6:
+        return np.nan, 0.0
+    means = []
+    for r in radii:
+        px = np.rint(x + r * _COS).astype(int)
+        py = np.rint(y + r * _SIN).astype(int)
+        ok = (px >= 0) & (px < w) & (py >= 0) & (py < h)
+        means.append(gray[py[ok], px[ok]].mean() if ok.sum() > 20 else np.nan)
+    means = np.array(means, dtype=float)
+    if np.isnan(means).all():
+        return np.nan, 0.0
+    means = np.nan_to_num(means, nan=np.nanmean(means))
+    grad = np.abs(np.gradient(cv2.GaussianBlur(
+        means.reshape(-1, 1), (1, 5), 0).ravel()))
+    i = int(np.argmax(grad))
+    strength = float(grad[i] / (grad.mean() + 1e-6))
+    return float(radii[i]), strength
+
+
+# ----------------------------------------------------------------------
+# JSON helper
+# ----------------------------------------------------------------------
+def _json_default(value):
+    if hasattr(value, "item"):
+        return value.item()
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    return str(value)
+
+
+def _clean(obj):
+    """Replace NaN with None for JSON output."""
+    if isinstance(obj, float) and np.isnan(obj):
+        return None
+    if isinstance(obj, dict):
+        return {k: _clean(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_clean(v) for v in obj]
+    return obj
+
+
+# ----------------------------------------------------------------------
+# SRID
+# ----------------------------------------------------------------------
+def analyse_srid(image_path, output_dir, min_radius_px=None,
+                 support_threshold=0.28, panels="single"):
+    """
+    SRID candidate analysis. Measurements are in pixels of the (possibly
+    downscaled) analysed image; `scale_to_original` is reported so values
+    can be converted back.
+    """
+    original = load_image(image_path)
+    image, scale = downscale_if_large(original)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     annotated = image.copy()
     records = []
-    panel_data = split_panels(image)
     global_well_number = 0
 
-    for panel_number, (panel, offset_x, offset_y) in enumerate(
-        panel_data, start=1
-    ):
+    for panel_number, (panel, off_x, off_y) in enumerate(
+            split_panels(image, panels), start=1):
         gray = prepare_image(panel)
+        edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 1), 35, 110)
+        wells = detect_wells(panel, min_radius_px=min_radius_px)
+        # Wells are punched with one tool: snap outlier radii to the median
+        # so a ring is never mistaken for a larger well.
+        if len(wells) >= 3:
+            med = int(np.median([c[2] for c in wells]))
+            wells = [(x, y, med if r > 1.35 * med else r, s)
+                     for x, y, r, s in wells]
+        max_ring_limit = int(min(gray.shape) * 0.45)
 
-        # Calculate edges once per panel, not once per radius.
-        blurred = cv2.GaussianBlur(gray, (5, 5), 1)
-        edges = cv2.Canny(blurred, 35, 110)
-
-        wells = detect_wells(panel, min_radius_px=12)
-
-        for x, y, well_radius, well_score in wells:
+        for x, y, well_radius, _ in wells:
             global_well_number += 1
+            min_ring = max(well_radius + 5, int(round(well_radius * 1.35)))
+            max_ring = min(int(round(well_radius * 3.7)), max_ring_limit)
 
-            min_ring = max(
-                well_radius + 5,
-                int(round(well_radius * 1.35))
-            )
-            max_ring = int(round(well_radius * 3.7))
-
-            candidates = []
-
+            best_support, best_radius = 0.0, None
             for radius in range(min_ring, max_ring + 1):
-                support = ring_support(edges, x, y, radius)
-                candidates.append((support, radius))
+                s = ring_support(edges, x, y, radius)
+                if s > best_support:
+                    best_support, best_radius = s, radius
 
-            candidates.sort(key=lambda item: item[0], reverse=True)
+            ring_detected = best_radius is not None and \
+                best_support >= support_threshold
 
-            best_support, best_radius = (
-                candidates[0] if candidates else (0.0, None)
-            )
+            prof_r, prof_strength = radial_profile_ring(
+                gray, x, y, well_radius, max_ring)
 
-            # Conservative candidate threshold.
-            # This does not establish that the edge is a true precipitin ring.
-            ring_detected = (
-                best_radius is not None
-                and best_support >= 0.28
-            )
-
-            gx = int(x + offset_x)
-            gy = int(y + offset_y)
-
-            cv2.circle(
-                annotated,
-                (gx, gy),
-                int(well_radius),
-                (255, 80, 180),
-                2
-            )
-
+            gx, gy = int(x + off_x), int(y + off_y)
+            cv2.circle(annotated, (gx, gy), int(well_radius),
+                       (255, 80, 180), 2)
+            cv2.putText(annotated, str(global_well_number),
+                        (gx - 6, gy + 5), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (255, 255, 255), 2)
             if ring_detected:
-                cv2.circle(
-                    annotated,
-                    (gx, gy),
-                    int(best_radius),
-                    (0, 165, 255),
-                    2
-                )
+                cv2.circle(annotated, (gx, gy), int(best_radius),
+                           (0, 165, 255), 2)
 
-            candidate_diameter = (
-                int(best_radius * 2) if ring_detected else None
-            )
-
-            # D squared is only a candidate image-derived value.
-            candidate_d2 = (
-                int(candidate_diameter ** 2)
-                if candidate_diameter is not None else None
-            )
-
+            diameter = float(best_radius * 2) if ring_detected else np.nan
             records.append({
-                "well_number": int(global_well_number),
-                "panel": int(panel_number),
+                "well_number": global_well_number,
+                "panel": panel_number,
                 "center_x_px": gx,
                 "center_y_px": gy,
                 "well_radius_px": int(well_radius),
                 "well_diameter_px": int(well_radius * 2),
-                "candidate_ring_radius_px": (
-                    int(best_radius) if ring_detected else None
-                ),
-                "candidate_ring_diameter_px": candidate_diameter,
-                "candidate_ring_d2_px2": candidate_d2,
+                "candidate_ring_radius_px":
+                    float(best_radius) if ring_detected else np.nan,
+                "candidate_ring_diameter_px": diameter,
+                "candidate_ring_d2_px2": diameter ** 2 if ring_detected
+                    else np.nan,
+                "profile_ring_diameter_px": prof_r * 2,
+                "profile_strength": round(prof_strength, 2),
                 "angular_support": round(float(best_support), 3),
                 "ring_candidate_detected": bool(ring_detected),
                 "review_required": True,
-                "measurement_status": (
-                    "CANDIDATE_REQUIRES_MANUAL_VERIFICATION"
-                    if ring_detected else "NO_CONFIRMED_RING"
-                )
             })
 
-    csv_path = output_dir / "srid_measurements.csv"
-    image_path_out = output_dir / "srid_annotated.png"
-    json_path = output_dir / "srid_report.json"
+    annotated_path = output_dir / "srid_annotated.png"
+    cv2.imwrite(str(annotated_path), annotated)
 
-    pd.DataFrame(records).to_csv(csv_path, index=False)
-    cv2.imwrite(str(image_path_out), annotated)
-
-    ring_count = sum(
-        1 for r in records if r["ring_candidate_detected"]
-    )
+    df = pd.DataFrame(records)
+    df.to_csv(output_dir / "srid_measurements.csv", index=False)
 
     report = {
         "assay": "SRID",
         "total_well_candidates": len(records),
-        "ring_candidates": ring_count,
+        "ring_candidates": int(sum(r["ring_candidate_detected"]
+                                   for r in records)),
         "measurement_unit": "pixels",
-        "d2_unit": "pixels_squared",
-        "calibration_available": False,
-        "concentration_calculation_available": False,
-        "manual_verification_required": True,
-        "notice": (
-            "Ring measurements and D-squared values are image-derived "
-            "candidates, not validated experimental measurements. "
-            "Verify ring boundaries manually. Antigen concentration "
-            "requires experimental calibration standards."
-        ),
-        "measurements": records
+        "scale_to_original": scale,
+        "image_size_analysed": [int(image.shape[1]), int(image.shape[0])],
+        "min_radius_used_px": (min_radius_px if min_radius_px is not None
+                               else auto_min_radius(image.shape)),
+        "annotated_image": str(annotated_path),
+        "notice": ("Rings and D² are image-derived candidates. Verify ring "
+                   "boundaries manually; concentration needs calibration "
+                   "standards."),
+        "measurements": records,
     }
-
-    json_path.write_text(
-        json.dumps(report, indent=2, default=lambda value: (
-            value.item() if hasattr(value, "item")
-            else value.tolist() if hasattr(value, "tolist")
-            else str(value)
-        )),
-        encoding="utf-8"
-    )
-
+    (output_dir / "srid_report.json").write_text(
+        json.dumps(_clean(report), indent=2, default=_json_default),
+        encoding="utf-8")
     return report
 
 
+# ----------------------------------------------------------------------
+# DID
+# ----------------------------------------------------------------------
+DID_PATTERNS = {
+    "pending": "Not yet interpreted.",
+    "identity": "Fused continuous precipitin lines (identical antigens).",
+    "partial_identity": "Fused lines with a spur (shared + unique epitopes).",
+    "non_identity": "Crossing precipitin lines (unrelated antigens).",
+    "no_precipitin": "No precipitin line formed (no reaction / out of "
+                     "equivalence zone).",
+}
 
-def analyse_did(image_path, output_dir, interpretation="pending"):
-    image = load_image(image_path)
+
+def analyse_did(image_path, output_dir, interpretation="pending",
+                min_radius_px=None):
+    original = load_image(image_path)
+    image, scale = downscale_if_large(original)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     annotated = image.copy()
     gray = prepare_image(image)
+    wells = detect_wells(image, min_radius_px=min_radius_px)
 
-    wells = detect_wells(image)
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 1), 35, 110)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    joined = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+    contours, _ = cv2.findContours(joined, cv2.RETR_LIST,
+                                   cv2.CHAIN_APPROX_SIMPLE)
 
-    edges = cv2.Canny(
-        cv2.GaussianBlur(gray, (5, 5), 1),
-        35,
-        110
-    )
+    well_mask = np.zeros(gray.shape, np.uint8)
+    for x, y, r, _ in wells:
+        cv2.circle(well_mask, (x, y), int(r * 1.25), 255, -1)
 
-    # Join nearby broken portions of possible precipitin lines.
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (5, 5)
-    )
-
-    joined = cv2.morphologyEx(
-        edges,
-        cv2.MORPH_CLOSE,
-        kernel,
-        iterations=2
-    )
-
-    contours, _ = cv2.findContours(
-        joined,
-        cv2.RETR_LIST,
-        cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    line_candidates = []
-
+    lines = []
     for contour in contours:
         length = cv2.arcLength(contour, False)
-
         if length < 35:
             continue
-
         x, y, w, h = cv2.boundingRect(contour)
-
-        # Avoid tiny text fragments and very large image borders.
         if w < 8 and h < 8:
             continue
-
-        if w > image.shape[1] * 0.95:
+        if w > image.shape[1] * 0.95 or h > image.shape[0] * 0.95:
             continue
-
-        if h > image.shape[0] * 0.95:
+        # Skip contours that are just well outlines.
+        m = np.zeros(gray.shape, np.uint8)
+        cv2.drawContours(m, [contour], -1, 255, 2)
+        overlap = cv2.countNonZero(cv2.bitwise_and(m, well_mask))
+        if overlap > 0.7 * max(cv2.countNonZero(m), 1):
             continue
+        lines.append({"line_id": len(lines) + 1, "x": int(x), "y": int(y),
+                      "width": int(w), "height": int(h),
+                      "contour_length_px": round(float(length), 2)})
+        cv2.drawContours(annotated, [contour], -1, (60, 220, 80), 2)
 
-        line_candidates.append({
-            "x": int(x),
-            "y": int(y),
-            "width": int(w),
-            "height": int(h),
-            "contour_length_px": round(float(length), 2)
-        })
+    well_rows = []
+    for n, (x, y, r, _) in enumerate(wells, start=1):
+        cv2.circle(annotated, (x, y), r, (255, 80, 180), 2)
+        cv2.putText(annotated, f"W{n}", (x + r + 2, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 80, 180), 1)
+        well_rows.append({"well": f"W{n}", "x_px": x, "y_px": y,
+                          "radius_px": r})
 
-        cv2.drawContours(
-            annotated,
-            [contour],
-            -1,
-            (60, 220, 80),
-            2
-        )
+    # Centre-to-centre distances (useful for diffusion / Fick's-law work).
+    distances = []
+    for i in range(len(well_rows)):
+        for j in range(i + 1, len(well_rows)):
+            a, b = well_rows[i], well_rows[j]
+            distances.append({
+                "from": a["well"], "to": b["well"],
+                "distance_px": round(float(np.hypot(
+                    a["x_px"] - b["x_px"], a["y_px"] - b["y_px"])), 1)})
 
-    for number, (x, y, radius, score) in enumerate(wells, start=1):
-        cv2.circle(
-            annotated,
-            (x, y),
-            radius,
-            (255, 80, 180),
-            2
-        )
+    annotated_path = output_dir / "did_annotated.png"
+    cv2.imwrite(str(annotated_path), annotated)
+    pd.DataFrame(lines).to_csv(output_dir / "did_line_candidates.csv",
+                               index=False)
 
-        cv2.putText(
-            annotated,
-            f"W{number}",
-            (x + radius, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (255, 80, 180),
-            1
-        )
-
-    image_path_out = output_dir / "did_annotated.png"
-    csv_path = output_dir / "did_line_candidates.csv"
-    json_path = output_dir / "did_report.json"
-
-    cv2.imwrite(str(image_path_out), annotated)
-    pd.DataFrame(line_candidates).to_csv(csv_path, index=False)
-
-    allowed = {
-        "pending",
-        "identity",
-        "partial_identity",
-        "non_identity"
-    }
-
-    if interpretation not in allowed:
+    if interpretation not in DID_PATTERNS:
         interpretation = "pending"
 
     report = {
         "assay": "DID",
         "well_candidates": len(wells),
-        "line_candidates": len(line_candidates),
+        "line_candidates": len(lines),
         "pattern_interpretation": interpretation,
-        "interpretation_status": (
-            "researcher_review_required"
-            if interpretation == "pending"
-            else "researcher_entered"
-        ),
-        "possible_patterns": {
-            "identity": "Fused continuous precipitin lines.",
-            "partial_identity": "Fused lines with a spur.",
-            "non_identity": "Crossing precipitin lines."
-        },
-        "notice": (
-            "Image processing identifies candidate wells and edges. "
-            "It does not independently confirm antigen identity, "
-            "partial identity, or non-identity. Confirm the pattern "
-            "by visual inspection of the experimental plate."
-        ),
-        "line_candidates_data": line_candidates
+        "interpretation_status": ("researcher_review_required"
+                                  if interpretation == "pending"
+                                  else "researcher_entered"),
+        "possible_patterns": DID_PATTERNS,
+        "annotated_image": str(annotated_path),
+        "scale_to_original": scale,
+        "notice": ("Image processing finds candidate wells and edges only. "
+                   "Identity / partial identity / non-identity must be "
+                   "confirmed by visual inspection of the plate."),
+        "wells": well_rows,
+        "well_distances": distances,
+        "line_candidates_data": lines,
     }
-
-    json_path.write_text(json.dumps(
-            report,
-            indent=2,
-            default=lambda value: (
-                value.item() if hasattr(value, "item")
-                else value.tolist() if hasattr(value, "tolist")
-                else str(value)
-            )
-        ))
-
+    (output_dir / "did_report.json").write_text(
+        json.dumps(_clean(report), indent=2, default=_json_default),
+        encoding="utf-8")
     return report
